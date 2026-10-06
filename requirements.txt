@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+numpy
+requests
+beautifulsoup4
+qdrant-client
+sentence-transformers
+rank-bm25
+google-generativeai

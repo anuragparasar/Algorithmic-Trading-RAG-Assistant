@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# CPU-only torch keeps the image far smaller than the default CUDA build
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY deriv_rag_pipeline.py deriv_trading_assistant.py ./
+
+# Hugging Face model cache (mounted as a volume in compose)
+ENV HF_HOME=/models
+
+EXPOSE 8000
+CMD ["python", "deriv_trading_assistant.py"]

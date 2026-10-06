@@ -1,0 +1,34 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - qdrant_data:/app/deriv_rag_db
+      - hf_cache:/models
+    restart: unless-stopped
+
+  # One-off job: docker compose run --rm ingest
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    command: ["python", "deriv_rag_pipeline.py"]
+    volumes:
+      - qdrant_data:/app/deriv_rag_db
+      - hf_cache:/models
+    profiles: ["ingest"]
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:80"   # keeps the origin at localhost:5173 so your CORS config still matches
+    depends_on:
+      - api
+
+volumes:
+  qdrant_data:
+  hf_cache:
