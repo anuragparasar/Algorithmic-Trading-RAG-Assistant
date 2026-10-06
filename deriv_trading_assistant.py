@@ -1,43 +1,38 @@
 import os
 import re
 import time
+import json
 import numpy as np
-from typing import List, Dict, Any, Union
-from pydantic import BaseModel, Field
-from openai import OpenAI, APIError, APIConnectionError, RateLimitError
+from typing import List, Dict, Any, Optional, Union
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, ValidationError
+import google.generativeai as genai
+from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, GoogleAPIError
 
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Gemini 1.5 models are retired (that's the 404). Override via GEMINI_MODEL in .env if needed.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 
 # ---------------------------------------------------------
-# 0. Tokenizer (must match the ingestion pipeline exactly)
+# 1. Schemas & Tokenizer
 # ---------------------------------------------------------
 def tokenize(text: str) -> List[str]:
-    """
-    FIX: previously this file used `doc["text"].lower().split()` while the
-    ingestion pipeline could use a different tokenizer entirely — BM25 scores
-    are only meaningful if the corpus was tokenized the same way at index
-    time and query time. This must be kept identical to the tokenizer used
-    in the ingestion script (deriv_rag_pipeline.py).
-    """
     text = text.lower()
-    tokens = re.findall(r"[a-z0-9_]+|%", text)
-    return tokens
+    return re.findall(r"[a-z0-9_]+|%", text)
 
 
-# ---------------------------------------------------------
-# 1. Output Schema Definition (Pydantic)
-# ---------------------------------------------------------
 class TradingAssistantResponse(BaseModel):
     answer: str = Field(description="Direct, concise explanation of the trading rule or API spec.")
-    # FIX: was Dict[str, float]. Real extracted specs aren't all numeric —
-    # things like contract_type ('CALL'/'PUT'), basis ('payout'/'stake'), or
-    # symbol codes ('R_100') are legitimate parameters too. Forcing float-only
-    # either makes the LLM drop these fields or coerce them into meaningless
-    # numbers to satisfy the schema. Union[float, str] lets both kinds through
-    # so the guardrail below can actually check what was extracted.
     exact_parameters: Dict[str, Union[float, str]] = Field(
         default_factory=dict,
         description="Extracted specs: numeric (tick intervals, margin rates, multipliers) or string (contract_type, basis, symbol codes)."
@@ -45,8 +40,20 @@ class TradingAssistantResponse(BaseModel):
     risk_warning: str = Field(description="Mandatory risk disclosure regarding the contract specs.")
 
 
+class QueryRequest(BaseModel):
+    query: str = Field(min_length=1)
+    top_k: int = Field(default=2, ge=1, le=10)
+
+
+class QueryResponse(BaseModel):
+    status: str
+    sources: List[str]
+    parameter_sources: Dict[str, List[str]]
+    structured_output: Dict[str, Any]
+
+
 # ---------------------------------------------------------
-# 2. RAG Execution & Guardrail Engine
+# 2. RAG Engine
 # ---------------------------------------------------------
 class DerivTradingAssistant:
     def __init__(self, db_path: str = "./deriv_rag_db", collection_name: str = "deriv_knowledge_base"):
@@ -55,27 +62,25 @@ class DerivTradingAssistant:
         self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
         print(f"Connecting to persistent Qdrant database at '{db_path}'...")
+        # NOTE: local-mode Qdrant takes a file lock; don't run ingestion while the API is up.
         self.vector_db = QdrantClient(path=db_path)
         self.collection_name = collection_name
 
-        # FIX: fail fast and clearly if the API key is missing, instead of
-        # letting it surface later as an opaque OpenAI error inside ask().
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            raise ValueError(
-                "OPENAI_API_KEY environment variable is not set. "
-                "Set it before instantiating DerivTradingAssistant."
-            )
-        self.llm_client = OpenAI(api_key=api_key)
+            raise ValueError("GEMINI_API_KEY environment variable is not set.")
+
+        genai.configure(api_key=api_key)
+        self.llm_model = genai.GenerativeModel(GEMINI_MODEL)
 
         self.documents: List[Dict[str, Any]] = []
-        self.bm25: BM25Okapi = None
+        self.bm25: Optional[BM25Okapi] = None
 
         self._rebuild_sparse_index()
 
     def _rebuild_sparse_index(self):
-        """Scrolls through the persistent Qdrant DB to load text payloads and rebuild the BM25 index."""
         print("Scrolling Qdrant database to rebuild BM25 sparse index...")
+        self.documents = []  # avoid duplicates if called twice
         next_page_offset = None
 
         while True:
@@ -86,7 +91,6 @@ class DerivTradingAssistant:
                 with_payload=True,
                 with_vectors=False
             )
-
             for record in records:
                 self.documents.append(record.payload)
 
@@ -96,33 +100,18 @@ class DerivTradingAssistant:
         if not self.documents:
             raise ValueError("No documents found in the database. Run the ingestion pipeline first.")
 
-        # FIX: use the shared tokenizer so BM25 term matching is consistent
-        # with however the ingestion pipeline tokenized these same texts.
         tokenized_corpus = [tokenize(doc["text"]) for doc in self.documents]
         self.bm25 = BM25Okapi(tokenized_corpus)
         print(f"Sparse index built successfully for {len(self.documents)} semantic chunks.")
 
     def retrieve_and_rerank(self, query: str, top_k: int = 3, candidate_k: int = 10, rrf_k: int = 60) -> List[Dict[str, Any]]:
-        """
-        Hybrid retrieval combining dense vector search and sparse keyword match,
-        fused via Reciprocal Rank Fusion, then reranked with a cross-encoder.
-
-        FIX (RRF implemented but unused): the ingestion pipeline defines RRF
-        fusion but the actual query path in this class used a cruder
-        "take top 5 from each, dedup by chunk_id" merge with no fusion
-        scoring at all — so RRF only ever ran in the pipeline's own demo,
-        never in the code that actually serves queries. This now applies the
-        same RRF approach here, so a chunk that ranks well in *both*
-        retrievers is prioritized into the reranker's candidate pool over one
-        that only barely made either list.
-        """
-        # A. Sparse Retrieval (BM25) — full ranked order, not just top 5
+        # A. Sparse retrieval (BM25) - skip zero-score docs so they don't pollute fusion
         bm25_scores = self.bm25.get_scores(tokenize(query))
-        sparse_ranked_idx = np.argsort(bm25_scores)[::-1][:candidate_k]
+        sparse_ranked_idx = [
+            int(i) for i in np.argsort(bm25_scores)[::-1][:candidate_k] if bm25_scores[i] > 0
+        ]
 
-        # B. Dense Retrieval (Qdrant)
-        # FIX: `.search()` is deprecated in recent qdrant-client versions;
-        # use `.query_points()` and pull `.points` off the result.
+        # B. Dense retrieval (Qdrant)
         query_vector = self.embedding_model.encode(query).tolist()
         dense_results = self.vector_db.query_points(
             collection_name=self.collection_name,
@@ -130,7 +119,7 @@ class DerivTradingAssistant:
             limit=candidate_k
         ).points
 
-        # C. Reciprocal Rank Fusion across the two ranked lists
+        # C. Reciprocal Rank Fusion
         rrf_scores: Dict[str, float] = {}
         doc_by_id: Dict[str, Dict[str, Any]] = {}
 
@@ -147,195 +136,208 @@ class DerivTradingAssistant:
 
         fused_ids = sorted(rrf_scores.items(), key=lambda kv: kv[1], reverse=True)
         candidate_docs = [doc_by_id[cid] for cid, _ in fused_ids]
+        if not candidate_docs:
+            return []
 
-        # D. Cross-Encoder Reranking of the fused candidate pool
+        # D. Cross-encoder reranking
         pairs = [[query, doc["text"]] for doc in candidate_docs]
         rerank_scores = self.reranker.predict(pairs)
 
-        ranked_pairs = sorted(zip(rerank_scores, candidate_docs), key=lambda x: x[0], reverse=True)
-        final_docs = [doc for score, doc in ranked_pairs][:top_k]
+        ranked = sorted(zip(rerank_scores, candidate_docs), key=lambda x: x[0], reverse=True)
+        return [doc for _, doc in ranked][:top_k]
 
-        return final_docs
+    # ---------------- Guardrail helpers ----------------
+    @staticmethod
+    def _normalize(text: str) -> str:
+        """Lowercase and strip thousands separators (1,000 -> 1000)."""
+        return re.sub(r"(?<=\d),(?=\d{3}(?!\d))", "", text.lower())
 
     @staticmethod
-    def _number_present(candidate_text: str, context_text: str) -> bool:
-        """Word-boundary check that a numeric value appears as an actual
-        standalone number in context_text (optionally with a trailing '%')."""
-        pattern = r"(?<![0-9.])" + re.escape(candidate_text) + r"%?(?![0-9])"
+    def _number_present(candidate: str, context_text: str) -> bool:
+        # Not part of a longer number on either side (so "5" doesn't match "1.5" or "5.5").
+        pattern = r"(?<![0-9.])" + re.escape(candidate) + r"(?![0-9]|\.[0-9])"
         return re.search(pattern, context_text) is not None
 
+    @staticmethod
+    def _as_number(text: str) -> Optional[float]:
+        cleaned = text.strip().replace(",", "").replace("$", "").rstrip("%").strip()
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _number_forms(value: float) -> set:
+        forms = {str(value), format(value, "g")}
+        if float(value).is_integer():
+            forms.add(str(int(value)))
+        return forms
+
+    def _value_supported(self, value: Union[float, str], normalized_text: str) -> bool:
+        """True if the value (numeric, numeric-looking string, or plain string) appears in the text."""
+        if isinstance(value, str):
+            stripped = value.strip().lower()
+            num = self._as_number(stripped)
+            if num is None:
+                return stripped in normalized_text
+            value = num
+        return any(self._number_present(c, normalized_text) for c in self._number_forms(value))
+
     def validate_guardrails(self, response: TradingAssistantResponse, context_chunks: List[str]) -> bool:
-        """
-        DETERMINISTIC GUARDRAIL: Validates against hallucinated specs.
+        context_text = self._normalize(" ".join(context_chunks))
 
-        FIX 1 (substring matching): the original check used plain substring
-        matching (`str(value) not in context_text`), so a hallucinated "10"
-        would pass simply because context containing "100" or "1000" also
-        contains the substring "10". Numeric values are now matched on word
-        boundaries, so a value only passes if it appears as an actual
-        standalone number in the context (optionally followed by '%').
-
-        FIX 2 (guardrail doesn't inspect answer numbers): the original only
-        checked `exact_parameters` — but `answer` is free text the LLM wrote
-        itself, and could easily state a number nowhere in
-        exact_parameters (e.g. "...which is about 25% higher than usual").
-        That number was never checked against anything. This now also scans
-        `answer` for numeric literals and validates each one the same way.
-        A small stopword-style allowlist avoids flagging incidental numbers
-        that aren't really "specs" (e.g. "step 1", "either of 2 options").
-        """
-        context_text = " ".join(context_chunks).lower()
-
-        # --- exact_parameters: numeric values checked against context;
-        # string values checked as case-insensitive substrings.
         for key, value in response.exact_parameters.items():
-            if isinstance(value, str):
-                if value.lower() not in context_text:
-                    print(f"[GUARDRAIL ALERT] Hallucinated parameter detected: {key} = {value!r}")
-                    return False
-                continue
-
-            candidates = {str(value)}
-            if float(value).is_integer():
-                candidates.add(str(int(value)))
-
-            if not any(self._number_present(c, context_text) for c in candidates):
-                print(f"[GUARDRAIL ALERT] Hallucinated parameter detected: {key} = {value}")
+            if not self._value_supported(value, context_text):
+                print(f"[GUARDRAIL ALERT] Unverified parameter: {key} = {value!r}")
                 return False
 
-        # --- answer text: any numeric literal mentioned in prose must also
-        # be traceable to the retrieved context.
-        answer_numbers = re.findall(r"\d+(?:\.\d+)?", response.answer)
-        for num in answer_numbers:
-            candidates = {num}
-            if "." not in num:
-                pass
-            elif num.endswith(".0"):
-                candidates.add(num[:-2])
-            if not any(self._number_present(c, context_text) for c in candidates):
+        for num in re.findall(r"\d+(?:\.\d+)?", self._normalize(response.answer)):
+            if not self._value_supported(float(num), context_text):
                 print(f"[GUARDRAIL ALERT] Unverified number in answer text: {num}")
                 return False
 
         return True
 
-    def ask(self, query: str) -> Dict[str, Any]:
-        """Executes the full pipeline: Retrieval -> Generation -> Guardrail validation."""
-        print(f"\n--- Processing Query: '{query}' ---")
+    # ---------------- Generation ----------------
+    def ask(self, query: str, top_k: int = 2) -> Dict[str, Any]:
+        best_docs = self.retrieve_and_rerank(query, top_k=top_k)
+        if not best_docs:
+            return {"status": "error", "message": "No relevant context found for this query."}
 
-        # 1. Retrieve & Rerank
-        best_docs = self.retrieve_and_rerank(query, top_k=2)
         context_chunks = [doc["text"] for doc in best_docs]
+        context_str = "\n\n".join(
+            f"Source ({doc.get('source_type', 'unknown')} - {doc.get('source_name', 'unknown')}):\n{doc['text']}"
+            for doc in best_docs
+        )
 
-        context_str = "\n\n".join([f"Source ({doc['source_type']} - {doc['source_name']}):\n{doc['text']}"
-                                   for doc in best_docs])
+        prompt = f"""You are a highly precise technical assistant for Deriv algorithmic trading.
+Use ONLY the provided context to answer the user's query. If the context does not contain the answer,
+say so in "answer" and leave "exact_parameters" empty. Never invent numbers.
 
-        # 2. LLM Generation
-        prompt = f"""
-        You are a highly precise technical assistant for Deriv algorithmic trading.
-        Use ONLY the provided context to answer the user's query. Extract any exact numerical
-        specifications (like tick intervals, margins, or API parameters) into the exact_parameters dictionary.
+Extract exact numerical or string specifications (tick intervals, margins, multipliers, contract types,
+symbol codes, API parameters) into "exact_parameters", copying values exactly as written in the context.
 
-        Context:
-        {context_str}
+Respond with ONLY a JSON object of this shape:
+{{
+  "answer": "<concise explanation>",
+  "exact_parameters": {{"<parameter_name>": <number or string>}},
+  "risk_warning": "<mandatory risk disclosure>"
+}}
 
-        User Query: {query}
-        """
+Context:
+{context_str}
 
-        print("Generating structured response...")
-        # FIX: added a small retry loop with backoff for transient
-        # connection/rate-limit errors, instead of failing on the first hiccup.
-        response_data = None
-        last_error = None
+User Query: {query}
+"""
+
+        # response_schema is deliberately NOT used: Gemini's schema format rejects
+        # Dict[str, Union[float, str]] (free-form objects). JSON mode + Pydantic validation instead.
+        generation_config = genai.GenerationConfig(
+            response_mime_type="application/json",
+            temperature=0.0,
+        )
+
+        response_data: Optional[TradingAssistantResponse] = None
+        last_error: Optional[Exception] = None
+
         for attempt in range(3):
             try:
-                completion = self.llm_client.beta.chat.completions.parse(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format=TradingAssistantResponse,
-                    temperature=0.0
-                )
-                response_data = completion.choices[0].message.parsed
+                response = self.llm_model.generate_content(prompt, generation_config=generation_config)
+                raw_json = json.loads(response.text)
+                response_data = TradingAssistantResponse(**raw_json)
                 break
-            except (RateLimitError, APIConnectionError) as e:
+            except (ResourceExhausted, ServiceUnavailable) as e:
                 last_error = e
-                wait = 2 ** attempt
-                print(f"  Transient error ({e}), retrying in {wait}s...")
-                time.sleep(wait)
-            except APIError as e:
+                time.sleep(2 ** attempt)
+            except (json.JSONDecodeError, ValidationError, TypeError) as e:
+                last_error = e  # malformed output; retry
+            except GoogleAPIError as e:
                 last_error = e
-                break  # non-transient API error, don't retry
-            except Exception as e:
+                break
+            except Exception as e:  # e.g. blocked response -> response.text raises ValueError
                 last_error = e
                 break
 
         if response_data is None:
-            return {"status": "error", "message": f"LLM Generation failed: {str(last_error)}"}
+            return {"status": "error", "message": f"LLM Generation failed: {last_error}"}
 
-        # 3. Guardrail Execution
-        passed_guardrail = self.validate_guardrails(response_data, context_chunks)
-
-        if not passed_guardrail:
+        if not self.validate_guardrails(response_data, context_chunks):
             return {
                 "status": "failed_guardrail",
                 "error": "The generated response contained unverified numerical parameters.",
                 "safe_fallback": "Please refer directly to the Deriv official documentation."
             }
 
-        # FIX (no claim-level source attribution): previously only an
-        # undifferentiated list of every source consulted was returned,
-        # with no way to tell which specific chunk backs which extracted
-        # parameter. This does a best-effort per-parameter lookup: for each
-        # extracted value, find which of the retrieved docs actually
-        # contains it. Best-effort because a value could legitimately appear
-        # in more than one chunk, or (rarely) be a paraphrase the guardrail's
-        # substring/number check still accepted.
         param_sources: Dict[str, List[str]] = {}
         for key, value in response_data.exact_parameters.items():
-            matches = []
-            for doc in best_docs:
-                text_lower = doc["text"].lower()
-                if isinstance(value, str):
-                    hit = value.lower() in text_lower
-                else:
-                    candidates = {str(value)}
-                    if float(value).is_integer():
-                        candidates.add(str(int(value)))
-                    hit = any(self._number_present(c, text_lower) for c in candidates)
-                if hit:
-                    matches.append(doc["source_name"])
-            param_sources[key] = matches
+            param_sources[key] = [
+                doc.get("source_name", "unknown")
+                for doc in best_docs
+                if self._value_supported(value, self._normalize(doc["text"]))
+            ]
 
         return {
             "status": "success",
-            "sources": [doc["source_name"] for doc in best_docs],
+            "sources": [doc.get("source_name", "unknown") for doc in best_docs],
             "parameter_sources": param_sources,
             "structured_output": response_data.model_dump()
         }
 
+
 # ---------------------------------------------------------
-# 3. Execution Example
+# 3. FastAPI Application Setup
 # ---------------------------------------------------------
-if __name__ == "__main__":
+state: Dict[str, Any] = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     try:
-        # Connects to the database created by your ingestion script
-        assistant = DerivTradingAssistant(db_path="./deriv_rag_db")
-
-        test_queries = [
-            "What happens when margin hits 50% on CFDs?",
-            "What is the required API payload for a proposal, and what is the Boom 1000 index tick frequency?"
-        ]
-
-        for q in test_queries:
-            result = assistant.ask(q)
-
-            if result["status"] == "success":
-                print("\n[Final Output Validated]")
-                print(f"Answer: {result['structured_output']['answer']}")
-                print(f"Extracted Params: {result['structured_output']['exact_parameters']}")
-                print(f"Risk Warning: {result['structured_output']['risk_warning']}")
-                print(f"Sources Used: {result['sources']}\n")
-            else:
-                print(f"\n[Request Failed] {result}\n")
-
+        state["assistant"] = DerivTradingAssistant(db_path="./deriv_rag_db")
+        print("API is ready to accept requests.")
     except Exception as e:
-        print(f"Pipeline Error: {e}")
+        print(f"Failed to initialize DerivTradingAssistant: {e}")
+        state["assistant"] = None
+
+    yield
+
+    state.clear()
+    print("Shutting down API...")
+
+
+app = FastAPI(
+    title="Deriv RAG API",
+    description=f"Hybrid retrieval trading assistant powered by {GEMINI_MODEL}",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],  # Vite default
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.post("/api/v1/ask", response_model=QueryResponse)
+def ask_question(req: QueryRequest):
+    assistant: Optional[DerivTradingAssistant] = state.get("assistant")
+    if not assistant:
+        raise HTTPException(status_code=500, detail="RAG Engine is not initialized properly.")
+
+    result = assistant.ask(req.query, top_k=req.top_k)
+
+    if result["status"] == "failed_guardrail":
+        raise HTTPException(status_code=422, detail=result)
+    elif result["status"] == "error":
+        raise HTTPException(status_code=502, detail=result)
+
+    return result
+
+
+if __name__ == "__main__":
+    import uvicorn
+    # Run the ingestion script first to create ./deriv_rag_db
+    uvicorn.run(app, host="0.0.0.0", port=8000)
