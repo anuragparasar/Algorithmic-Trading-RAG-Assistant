@@ -9,3 +9,6 @@ qdrant-client
 sentence-transformers
 rank-bm25
 google-generativeai
+websocket-client
+langgraph
+langchain-google-genai

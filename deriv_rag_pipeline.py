@@ -2,8 +2,8 @@ import os
 import re
 import json
 import requests
-from typing import List, Dict, Any
-from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel, Field
 
 from qdrant_client import QdrantClient
@@ -17,159 +17,360 @@ from rank_bm25 import BM25Okapi
 # ---------------------------------------------------------------------------
 class IngestedChunk(BaseModel):
     chunk_id: str
-    source_type: str  # "api_schema", "spec_table", or "markdown_doc"
+    source_type: str  # "api_schema", "api_response", "official_doc", "spec_table", or "markdown_doc"
     source_name: str
     content: str
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
+# Source repository + local download cache
+# ---------------------------------------------------------------------------
+DERIV_REPO = "binary-com/deriv-api-docs"
+DERIV_BRANCH = "master"
+RAW_BASE = f"https://raw.githubusercontent.com/{DERIV_REPO}/{DERIV_BRANCH}"
+TREE_URL = f"https://api.github.com/repos/{DERIV_REPO}/git/trees/{DERIV_BRANCH}?recursive=1"
+CACHE_DIR = os.getenv("DERIV_SOURCE_CACHE", "./deriv_source_cache")
+
+# Used only if the repo file listing can't be fetched AND isn't cached.
+DEFAULT_API_CALLS = ["active_symbols", "proposal", "buy", "ticks_history", "statement", "contracts_for"]
+
+MAX_CHUNK_CHARS = 1200  # all-MiniLM-L6-v2 truncates at 256 word pieces (~1000-1200 chars)
+
+
+def _cache_path(key: str) -> str:
+    return os.path.join(CACHE_DIR, *key.split("/"))
+
+
+def fetch_text(url: str, cache_key: str, retries: int = 2, timeout: int = 15) -> Optional[str]:
+    """GET a URL, caching the body on disk. Falls back to the cached copy if the network fails."""
+    headers = {}
+    if "api.github.com" in url and os.getenv("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.getenv('GITHUB_TOKEN')}"
+
+    path = _cache_path(cache_key)
+    for _ in range(retries):
+        try:
+            res = requests.get(url, timeout=timeout, headers=headers)
+            if res.status_code == 200:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(res.text)
+                return res.text
+            if res.status_code == 404:
+                return None
+        except requests.RequestException:
+            pass
+
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    return None
+
+
+def list_repo_files() -> List[str]:
+    text = fetch_text(TREE_URL, "_tree.json")
+    if not text:
+        return []
+    try:
+        return [item["path"] for item in json.loads(text).get("tree", []) if item.get("type") == "blob"]
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+
+# ---------------------------------------------------------------------------
+# JSON-schema -> readable text
+# ---------------------------------------------------------------------------
+def _fmt_enum(values: List[Any], limit: int = 30) -> str:
+    shown = ", ".join(str(v) for v in values[:limit])
+    return shown + (f", ... (+{len(values) - limit} more)" if len(values) > limit else "")
+
+
+def describe_properties(properties: Dict[str, Any], required: List[str], prefix: str = "",
+                        depth: int = 0, max_depth: int = 2) -> List[str]:
+    lines = []
+    for name, spec in properties.items():
+        if not isinstance(spec, dict):
+            continue
+        p_type = spec.get("type", "any")
+        if isinstance(p_type, list):
+            p_type = "|".join(p_type)
+        req = "[REQUIRED]" if name in required else "[OPTIONAL]"
+        desc = re.sub(r"^\[Optional\]\s*", "", spec.get("description", "").strip())
+        extras = []
+        if "enum" in spec:
+            extras.append(f"Allowed values: {_fmt_enum(spec['enum'])}")
+        for key, label in (("default", "Default"), ("minimum", "Minimum"), ("maximum", "Maximum")):
+            if key in spec:
+                extras.append(f"{label}: {spec[key]}")
+        if "examples" in spec:
+            extras.append(f"Example: {_fmt_enum(spec['examples'], 3)}")
+        line = f"{'  ' * depth}  * {prefix}{name} ({p_type}) {req}: {desc}"
+        if extras:
+            line += " " + "; ".join(extras) + "."
+        lines.append(line)
+
+        if depth < max_depth:
+            nested = spec.get("properties")
+            if not nested and isinstance(spec.get("items"), dict):
+                nested = spec["items"].get("properties")
+                req_nested = spec["items"].get("required", [])
+            else:
+                req_nested = spec.get("required", [])
+            if nested:
+                lines.extend(describe_properties(nested, req_nested, f"{prefix}{name}.", depth + 1, max_depth))
+    return lines
+
+
+def pack_lines(header: str, lines: List[str], max_chars: int = MAX_CHUNK_CHARS) -> List[str]:
+    """Group lines into chunks under max_chars, repeating the header in each chunk."""
+    parts, current = [], []
+    size = len(header)
+    for line in lines:
+        if len(line) > max_chars:
+            line = line[: max_chars - 3] + "..."
+        if current and size + len(line) + 1 > max_chars:
+            parts.append(header + "\n".join(current))
+            current, size = [], len(header)
+        current.append(line)
+        size += len(line) + 1
+    if current or not parts:
+        parts.append(header + "\n".join(current))
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# Markdown / MDX cleanup + splitting
+# ---------------------------------------------------------------------------
+def clean_markdown(raw: str) -> Tuple[str, str]:
+    """Strip front-matter, MDX imports and JSX/HTML tags. Returns (title, body)."""
+    title = ""
+    fm = re.match(r"^---\s*\n(.*?)\n---\s*\n", raw, re.S)
+    if fm:
+        t = re.search(r"^title:\s*(.+)$", fm.group(1), re.M)
+        if t:
+            title = t.group(1).strip().strip("'\"")
+        raw = raw[fm.end():]
+    raw = re.sub(r"^\s*(import|export)\s.*$", "", raw, flags=re.M)
+    raw = re.sub(r"<[A-Za-z][^>]*/>", "", raw)              # self-closing JSX
+    raw = re.sub(r"</?[A-Za-z][^>]*>", "", raw)             # remaining tags
+    raw = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", raw)          # images
+    raw = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", raw)      # links -> text
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+    return title, raw.strip()
+
+
+def split_markdown_sections(body: str, doc_title: str) -> List[Tuple[str, str]]:
+    """Split on #/##/### headers, then by paragraphs so no section exceeds MAX_CHUNK_CHARS."""
+    out = []
+    for sec in re.split(r"\n(?=#{1,4} )", "\n" + body):
+        sec = sec.strip()
+        if not sec:
+            continue
+        if sec.startswith("#"):
+            first, _, rest = sec.partition("\n")
+            header = first.lstrip("#").strip()
+            text = rest.strip()
+        else:
+            header, text = doc_title, sec
+        if not text:
+            continue
+        paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+        buf = ""
+        for p in paragraphs:
+            if buf and len(buf) + len(p) + 2 > MAX_CHUNK_CHARS:
+                out.append((header, buf))
+                buf = ""
+            buf = f"{buf}\n\n{p}" if buf else p[: MAX_CHUNK_CHARS * 2]
+        if buf:
+            out.append((header, buf))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 2. Specialized Ingestion Loaders for Deriv Data
 # ---------------------------------------------------------------------------
 class DerivDataIngestionEngine:
-    def __init__(self):
-        pass
+    # Hand-written schemas used only when an endpoint can't be fetched live or from cache.
+    FALLBACK_SCHEMAS = {
+        "proposal": (
+            "Deriv WebSocket API Call: `proposal`\n"
+            "Summary: Gets latest price and payout for a specific contract type.\n"
+            "Parameters:\n"
+            "  * amount (number) [REQUIRED]: Proposed stake or payout.\n"
+            "  * basis (string) [REQUIRED]: 'payout' or 'stake'.\n"
+            "  * contract_type (string) [REQUIRED]: e.g., 'CALL', 'PUT', 'MULTUP', 'MULTDOWN'.\n"
+            "  * currency (string) [REQUIRED]: Currency code (e.g. USD, EUR).\n"
+            "  * symbol (string) [REQUIRED]: Symbol code (e.g. R_100, 1HZ100V, BOOM1000)."
+        ),
+        "buy": (
+            "Deriv WebSocket API Call: `buy`\n"
+            "Summary: Buys a contract, either by proposal id or inline parameters.\n"
+            "Parameters:\n"
+            "  * buy (string) [REQUIRED]: The proposal id from a `proposal` call, "
+            "or '1' if contract parameters are passed directly in `parameters`.\n"
+            "  * price (string) [REQUIRED]: Maximum price at which to purchase the contract.\n"
+            "  * parameters (object) [OPTIONAL]: Inline contract parameters, used when "
+            "`buy` is set to '1' instead of a proposal id.\n"
+            "  * loginid (string) [OPTIONAL]: Required only when multiple tokens were "
+            "provided during authorize.\n"
+            "  * subscribe (integer) [OPTIONAL]: Set to 1 to stream updates."
+        ),
+    }
+
+    def __init__(self, max_workers: int = 16):
+        self.max_workers = max_workers
+        self.repo_files = list_repo_files()
+        if self.repo_files:
+            print(f"Found {len(self.repo_files)} files in {DERIV_REPO}.")
+        else:
+            print(f"WARNING: could not list {DERIV_REPO}; using the default endpoint list only.")
+
+    def _api_calls(self) -> List[str]:
+        calls = sorted({
+            p.split("/")[2] for p in self.repo_files
+            if p.startswith("config/v3/") and p.endswith("/send.json")
+        })
+        return calls or DEFAULT_API_CALLS
+
+    def _schema_chunks(self, call: str) -> List[IngestedChunk]:
+        chunks: List[IngestedChunk] = []
+        send_raw = fetch_text(f"{RAW_BASE}/config/v3/{call}/send.json", f"config/v3/{call}/send.json")
+        recv_raw = fetch_text(f"{RAW_BASE}/config/v3/{call}/receive.json", f"config/v3/{call}/receive.json")
+
+        # ---- Request schema ----
+        send = None
+        if send_raw:
+            try:
+                send = json.loads(send_raw)
+            except json.JSONDecodeError:
+                send = None
+
+        if send:
+            required = send.get("required", [])
+            auth = send.get("auth_required", 0)
+            scopes = send.get("auth_scopes", [])
+            header = (
+                f"Deriv WebSocket API Call: `{call}` (request)\n"
+                f"Action: {send.get('title', call)}\n"
+                f"Summary: {send.get('description', 'No description')}\n"
+                f"Authorization required: {'yes' if auth else 'no'}"
+                + (f" (scopes: {', '.join(scopes)})" if scopes else "") + "\n"
+                f"Required fields: {', '.join(required) if required else 'none'}\n"
+                "Parameters:\n"
+            )
+            lines = describe_properties(send.get("properties", {}), required)
+            for i, text in enumerate(pack_lines(header, lines)):
+                chunks.append(IngestedChunk(
+                    chunk_id=f"api_{call}" if i == 0 else f"api_{call}_p{i}",
+                    source_type="api_schema",
+                    source_name=f"{call}_schema",
+                    content=text,
+                    metadata={"endpoint": call, "required_params": required, "part": i,
+                              "url": f"https://github.com/{DERIV_REPO}/blob/{DERIV_BRANCH}/config/v3/{call}/send.json"},
+                ))
+        elif call in self.FALLBACK_SCHEMAS:
+            print(f"  Using hardcoded fallback for '{call}'")
+            chunks.append(IngestedChunk(
+                chunk_id=f"api_{call}_fallback", source_type="api_schema", source_name=f"{call}_spec",
+                content=self.FALLBACK_SCHEMAS[call], metadata={"endpoint": call, "source": "fallback"},
+            ))
+        else:
+            # An explicit "unavailable" chunk beats a silent gap: queries about this endpoint
+            # surface "verify manually" instead of results for a neighbouring endpoint.
+            chunks.append(IngestedChunk(
+                chunk_id=f"api_{call}_unavailable", source_type="api_schema", source_name=f"{call}_schema",
+                content=(
+                    f"Deriv WebSocket API Call: `{call}`\n"
+                    "Schema unavailable: this endpoint could not be fetched live and has no verified "
+                    "offline fallback in this system. Do not assume its required parameters - check "
+                    "https://api.deriv.com or the official deriv-api-docs repository directly."
+                ),
+                metadata={"endpoint": call, "source": "unavailable"},
+            ))
+
+        # ---- Response schema (fields of the main response object) ----
+        recv = None
+        if recv_raw:
+            try:
+                recv = json.loads(recv_raw)
+            except json.JSONDecodeError:
+                recv = None
+        if recv:
+            props = recv.get("properties", {})
+            body = props.get(call) if isinstance(props.get(call), dict) else {}
+            items = body.get("items") if isinstance(body.get("items"), dict) else {}
+            if body.get("properties"):
+                lines = describe_properties(body["properties"], body.get("required", []), max_depth=1)
+            elif items.get("properties"):
+                lines = describe_properties(items["properties"], items.get("required", []), max_depth=1)
+            else:
+                top = {k: v for k, v in props.items() if k not in ("echo_req", "req_id", "passthrough")}
+                lines = describe_properties(top, recv.get("required", []), max_depth=1)
+            header = (
+                f"Deriv WebSocket API Call: `{call}` (response)\n"
+                f"Action: {recv.get('title', call)}\n"
+                f"Summary: {recv.get('description', 'No description')}\n"
+                "Response fields:\n"
+            )
+            for i, text in enumerate(pack_lines(header, lines)):
+                chunks.append(IngestedChunk(
+                    chunk_id=f"api_{call}_response" + (f"_p{i}" if i else ""),
+                    source_type="api_response",
+                    source_name=f"{call}_response",
+                    content=text,
+                    metadata={"endpoint": call, "part": i},
+                ))
+        return chunks
 
     def fetch_live_deriv_api_schemas(self) -> List[IngestedChunk]:
-        """
-        Pulls real public JSON schemas from Deriv's API repo (or official schema source).
-        Deconstructs complex request/response schemas into individual searchable API calls.
-
-        FIX: previously, the hardcoded fallback only kicked in if ALL calls failed
-        (`if not chunks`). Now each individual endpoint that fails to fetch gets its
-        own fallback entry (where we have one) or is explicitly logged as missing,
-        so a partial GitHub outage doesn't silently produce a half-empty index.
-        """
-        chunks = []
-
-        api_calls = [
-            "active_symbols",
-            "proposal",
-            "buy",
-            "ticks_history",
-            "statement",
-            "contracts_for",
-        ]
-
-        base_url = "https://raw.githubusercontent.com/binary-com/deriv-api-docs/master/config/v3"
-
-        # Fallback content for endpoints we can hardcode if the network fetch fails.
-        # Only "proposal" is filled in below as before; extend this dict to cover
-        # more endpoints if offline ingestion needs to be more complete.
-        # NOTE (missing API fallback coverage): only endpoints with a schema
-        # we've actually verified are listed here. It would be worse to guess
-        # at required fields for a trading API than to leave a gap — a
-        # confidently wrong "required" list is more dangerous than an honest
-        # "unavailable, check docs" chunk (added below for whatever isn't
-        # covered here).
-        fallback_schemas = {
-            "proposal": (
-                "Deriv WebSocket API Call: `proposal`\n"
-                "Summary: Gets latest price and payout for a specific contract type.\n"
-                "Parameters:\n"
-                "  * amount (number) [REQUIRED]: Proposed stake or payout.\n"
-                "  * basis (string) [REQUIRED]: 'payout' or 'stake'.\n"
-                "  * contract_type (string) [REQUIRED]: e.g., 'CALL', 'PUT', 'MULTUP', 'MULTDOWN'.\n"
-                "  * currency (string) [REQUIRED]: Currency code (e.g. USD, EUR).\n"
-                "  * symbol (string) [REQUIRED]: Symbol code (e.g. R_100, 1HZ100V, BOOM1000)."
-            ),
-            "buy": (
-                "Deriv WebSocket API Call: `buy`\n"
-                "Summary: Buys a contract, either by proposal id or inline parameters.\n"
-                "Parameters:\n"
-                "  * buy (string) [REQUIRED]: The proposal id from a `proposal` call, "
-                "or '1' if contract parameters are passed directly in `parameters`.\n"
-                "  * price (string) [REQUIRED]: Maximum price at which to purchase the contract.\n"
-                "  * parameters (object) [OPTIONAL]: Inline contract parameters, used when "
-                "`buy` is set to '1' instead of a proposal id.\n"
-                "  * loginid (string) [OPTIONAL]: Required only when multiple tokens were "
-                "provided during authorize.\n"
-                "  * subscribe (integer) [OPTIONAL]: Set to 1 to stream updates."
-            ),
-        }
-
-        print("Fetching live Deriv API schemas...")
-        failed_calls = []
-        for call in api_calls:
-            url = f"{base_url}/{call}/send.json"
-            fetched = False
-            for attempt in range(2):  # simple retry once on failure
-                try:
-                    res = requests.get(url, timeout=8)
-                    if res.status_code == 200:
-                        schema = res.json()
-
-                        title = schema.get("title", call)
-                        desc = schema.get("description", "No description")
-                        properties = schema.get("properties", {})
-                        required_fields = schema.get("required", [])
-
-                        param_details = []
-                        for param, details in properties.items():
-                            p_type = details.get("type", "any")
-                            p_desc = details.get("description", "").strip()
-                            req_str = "[REQUIRED]" if param in required_fields else "[OPTIONAL]"
-                            param_details.append(f"  * {param} ({p_type}) {req_str}: {p_desc}")
-
-                        doc_text = (
-                            f"Deriv WebSocket API Call: `{call}`\n"
-                            f"Action: {title}\n"
-                            f"Summary: {desc}\n"
-                            f"Parameters:\n" + "\n".join(param_details)
-                        )
-
-                        chunks.append(IngestedChunk(
-                            chunk_id=f"api_{call}",
-                            source_type="api_schema",
-                            source_name=f"{call}_schema",
-                            content=doc_text,
-                            metadata={"endpoint": call, "required_params": required_fields}
-                        ))
-                        fetched = True
-                        break
-                    else:
-                        print(f"  {call}: HTTP {res.status_code}, retrying..." if attempt == 0 else f"  {call}: HTTP {res.status_code}, giving up")
-                except requests.RequestException as e:
-                    print(f"  {call}: request error ({e}), {'retrying...' if attempt == 0 else 'giving up'}")
-
-            if not fetched:
-                failed_calls.append(call)
-                if call in fallback_schemas:
-                    print(f"  Using hardcoded fallback for '{call}'")
-                    chunks.append(IngestedChunk(
-                        chunk_id=f"api_{call}_fallback",
-                        source_type="api_schema",
-                        source_name=f"{call}_spec",
-                        content=fallback_schemas[call],
-                        metadata={"endpoint": call, "source": "fallback"}
-                    ))
-
-        if failed_calls:
-            missing = [c for c in failed_calls if c not in fallback_schemas]
-            if missing:
-                print(f"WARNING: no verified data ingested for endpoints: {missing}")
-                # FIX: previously this was only a console warning — a gap in
-                # the knowledge base with no trace inside it. Ingest an
-                # explicit placeholder chunk instead, so a query about one of
-                # these endpoints surfaces "verify manually" rather than
-                # silently returning no results (or, worse, results for the
-                # wrong endpoint that happen to rank nearby).
-                for call in missing:
-                    chunks.append(IngestedChunk(
-                        chunk_id=f"api_{call}_unavailable",
-                        source_type="api_schema",
-                        source_name=f"{call}_schema",
-                        content=(
-                            f"Deriv WebSocket API Call: `{call}`\n"
-                            "Schema unavailable: this endpoint could not be fetched live and "
-                            "has no verified offline fallback in this system. Do not assume "
-                            "its required parameters — check https://api.deriv.com or the "
-                            "official deriv-api-docs repository directly."
-                        ),
-                        metadata={"endpoint": call, "source": "unavailable"}
-                    ))
-
+        """Every endpoint in deriv-api-docs/config/v3: request params + response fields."""
+        calls = self._api_calls()
+        print(f"Fetching request/response schemas for {len(calls)} API endpoints...")
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            results = list(pool.map(self._schema_chunks, calls))
+        chunks = [c for group in results for c in group]
+        unavailable = [c.metadata["endpoint"] for c in chunks if c.metadata.get("source") == "unavailable"]
+        if unavailable:
+            print(f"WARNING: no verified schema for endpoints: {unavailable}")
         return chunks
+
+    def _doc_chunks(self, path: str) -> List[IngestedChunk]:
+        raw = fetch_text(f"{RAW_BASE}/{path}", path)
+        if not raw:
+            return []
+        title, body = clean_markdown(raw)
+        if not title:
+            title = path.rsplit("/", 2)[-2].replace("-", " ").strip("_").capitalize()
+        slug = re.sub(r"[^a-z0-9]+", "_", path.lower()).strip("_")
+        chunks = []
+        for i, (header, text) in enumerate(split_markdown_sections(body, title)):
+            if len(text) < 40:  # skip stubs like "Coming soon"
+                continue
+            name = title if header == title else f"{title} - {header}"
+            chunks.append(IngestedChunk(
+                chunk_id=f"doc_{slug}_{i}",
+                source_type="official_doc",
+                source_name=name,
+                content=f"Topic: {name}\n{text}",
+                metadata={"doc_title": title, "header": header, "repo_path": path,
+                          "url": f"https://github.com/{DERIV_REPO}/blob/{DERIV_BRANCH}/{path}"},
+            ))
+        return chunks
+
+    def fetch_official_docs(self) -> List[IngestedChunk]:
+        """Markdown/MDX pages from deriv-api-docs/docs (concepts, guides, FAQ, terminology, examples)."""
+        paths = [
+            p for p in self.repo_files
+            if p.startswith("docs/") and p.endswith((".md", ".mdx")) and "backup" not in p
+        ]
+        if not paths:
+            print("WARNING: no documentation pages found to ingest.")
+            return []
+        print(f"Fetching {len(paths)} documentation pages...")
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            results = list(pool.map(self._doc_chunks, paths))
+        return [c for group in results for c in group]
 
     def ingest_synthetic_indices_matrix(self) -> List[IngestedChunk]:
         """
@@ -285,6 +486,261 @@ class DerivDataIngestionEngine:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Live market data from Deriv's public WebSocket (no auth required)
+# ---------------------------------------------------------------------------
+# Docs: https://developers.deriv.com/llms/active-symbols.md (and contracts-for, trading-times)
+DERIV_PUBLIC_WS = os.getenv("DERIV_PUBLIC_WS", "wss://api.derivws.com/trading/v1/options/ws/public")
+
+# Readable names for contract_category codes returned by contracts_for.
+CONTRACT_CATEGORY_NAMES = {
+    "accumulator": "Accumulators",
+    "asian": "Asians",
+    "callput": "Rise/Fall",
+    "callputequal": "Rise/Fall Equal",
+    "digits": "Digits",
+    "endsinout": "Ends Between/Ends Outside",
+    "higherlower": "Higher/Lower",
+    "highlowticks": "High/Low Ticks",
+    "multiplier": "Multipliers",
+    "reset": "Reset Call/Reset Put",
+    "runs": "Only Ups/Only Downs",
+    "staysinout": "Stays Between/Goes Outside",
+    "touchnotouch": "Touch/No Touch",
+    "turbos": "Turbos",
+    "vanilla": "Vanilla Options",
+}
+
+# Fields that are rules of the contract (stable). Price-dependent fields such as
+# barrier, high_barrier, low_barrier, barrier_choices, stakes and barrier offsets
+# change with every tick, so they are deliberately NOT stored.
+RANGE_FIELDS = {
+    "multiplier_range": "Multipliers",
+    "cancellation_range": "Deal cancellation options",
+    "growth_rate_range": "Growth rates",
+    "last_digit_range": "Last digit predictions",
+    "payout_choices": "Payout per point choices",
+}
+
+
+def _fmt_duration(value: str) -> str:
+    if value in (None, "", "0"):
+        return "no fixed expiry"
+    units = {"t": "ticks", "s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
+    m = re.fullmatch(r"(\d+)([tsmhd])", str(value))
+    if not m:
+        return str(value)
+    n, unit = m.group(1), units[m.group(2)]
+    return f"{n} {unit[:-1] if n == '1' else unit}"
+
+
+class DerivLiveMarketIngestion:
+    """Symbols, available contracts and trading hours from Deriv's public market-data WebSocket.
+
+    Fetched once per ingestion run (not per question). Raw responses are cached so a failed
+    run falls back to the last successful fetch; nothing here is hand-written.
+    """
+
+    def __init__(self, url: str = DERIV_PUBLIC_WS, timeout: int = 20):
+        self.url = url
+        self.timeout = timeout
+        self.fetched_at: Optional[str] = None
+
+    # ---------------- transport ----------------
+    def _fetch_all(self) -> Optional[Dict[str, Any]]:
+        import websocket  # websocket-client
+        from datetime import datetime, timezone
+
+        ws = websocket.create_connection(self.url, timeout=self.timeout)
+        req_id = 0
+
+        def call(payload: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal req_id
+            req_id += 1
+            ws.send(json.dumps({**payload, "req_id": req_id}))
+            while True:  # skip anything that isn't the reply to this request
+                msg = json.loads(ws.recv())
+                if msg.get("req_id") == req_id:
+                    return msg
+
+        try:
+            symbols_res = call({"active_symbols": "full"})
+            if "error" in symbols_res:
+                raise RuntimeError(f"active_symbols: {symbols_res['error']}")
+            symbols = symbols_res.get("active_symbols", [])
+            if not symbols:
+                raise RuntimeError("active_symbols returned no symbols")
+
+            times_res = call({"trading_times": "today"})
+            trading_times = times_res.get("trading_times", {}) if "error" not in times_res else {}
+
+            contracts: Dict[str, Any] = {}
+            for i, s in enumerate(symbols, 1):
+                sym = s["underlying_symbol"]
+                res = call({"contracts_for": sym})
+                contracts[sym] = res.get("contracts_for", {}).get("available", []) if "error" not in res else []
+                if i % 20 == 0:
+                    print(f"  contracts_for: {i}/{len(symbols)} symbols")
+        finally:
+            ws.close()
+
+        return {
+            "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "active_symbols": symbols,
+            "trading_times": trading_times,
+            "contracts_for": contracts,
+        }
+
+    def _load(self) -> Optional[Dict[str, Any]]:
+        cache = _cache_path("live/market_snapshot.json")
+        try:
+            data = self._fetch_all()
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            with open(cache, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            return data
+        except Exception as e:
+            print(f"WARNING: live market fetch failed ({e}).")
+            if os.path.exists(cache):
+                with open(cache, encoding="utf-8") as f:
+                    data = json.load(f)
+                print(f"  Using cached market snapshot from {data.get('fetched_at')}.")
+                return data
+            return None
+
+    # ---------------- chunk building ----------------
+    @staticmethod
+    def _hours_index(trading_times: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        index = {}
+        for market in trading_times.get("markets", []):
+            for sub in market.get("submarkets", []):
+                for s in sub.get("symbols", []):
+                    index[s.get("underlying_symbol")] = {
+                        "market_name": market.get("name"),
+                        "submarket_name": sub.get("name"),
+                        **s,
+                    }
+        return index
+
+    @staticmethod
+    def _contract_lines(available: List[Dict[str, Any]]) -> List[str]:
+        lines = []
+        by_cat: Dict[str, List[Dict[str, Any]]] = {}
+        for c in available:
+            by_cat.setdefault(c.get("contract_category", "other"), []).append(c)
+        for cat in sorted(by_cat):
+            name = CONTRACT_CATEGORY_NAMES.get(cat, cat)
+            lines.append(f"  * {name} (category `{cat}`):")
+            seen = set()
+            for c in sorted(by_cat[cat], key=lambda c: (c.get("contract_type", ""), c.get("expiry_type", ""))):
+                key = (c.get("contract_type"), c.get("expiry_type"), c.get("start_type"),
+                       c.get("min_contract_duration"), c.get("max_contract_duration"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                expiry = c.get("expiry_type", "?")
+                if expiry == "no_expiry":
+                    duration = "no fixed expiry"
+                else:
+                    duration = (f"duration {_fmt_duration(c.get('min_contract_duration'))} to "
+                                f"{_fmt_duration(c.get('max_contract_duration'))}")
+                extras = [f"{label}: {', '.join(str(v) for v in c[field])}"
+                          for field, label in RANGE_FIELDS.items() if c.get(field)]
+                if c.get("start_type") == "forward":
+                    extras.append("forward-starting")
+                line = f"    - contract_type `{c.get('contract_type')}` ({expiry} expiry): {duration}"
+                if extras:
+                    line += "; " + "; ".join(extras)
+                lines.append(line)
+        return lines
+
+    def fetch_market_chunks(self) -> List[IngestedChunk]:
+        print(f"Fetching live market data from {self.url} ...")
+        data = self._load()
+        if not data:
+            print("WARNING: no live market data available; symbol/contract questions will be unanswerable.")
+            return []
+
+        fetched_at = data["fetched_at"]
+        hours = self._hours_index(data.get("trading_times", {}))
+        source_note = f"Source: Deriv public API (active_symbols, contracts_for, trading_times), fetched {fetched_at}."
+        chunks: List[IngestedChunk] = []
+        submarkets: Dict[Tuple[str, str], List[str]] = {}
+
+        for s in data["active_symbols"]:
+            sym = s["underlying_symbol"]
+            name = s.get("underlying_symbol_name", sym)
+            h = hours.get(sym, {})
+            market_name = h.get("market_name") or s.get("market")
+            submarket_name = h.get("submarket_name") or s.get("submarket")
+            submarkets.setdefault((market_name, submarket_name), []).append(f"{sym} ({name})")
+
+            available = data["contracts_for"].get(sym, [])
+            categories = sorted({CONTRACT_CATEGORY_NAMES.get(c.get("contract_category"), c.get("contract_category"))
+                                 for c in available})
+            times = h.get("times", {})
+            hours_line = ""
+            if times:
+                opens, closes = times.get("open", []), times.get("close", [])
+                if opens == ["00:00:00"] and closes == ["23:59:59"]:
+                    hours_line = "Trading hours: open all day (00:00-23:59:59 UTC)"
+                else:
+                    hours_line = "Trading hours (UTC): " + ", ".join(f"{o}-{c}" for o, c in zip(opens, closes))
+                if h.get("trading_days"):
+                    hours_line += f" on {', '.join(h['trading_days'])}"
+            events = "; ".join(f"{e.get('descrip')} ({e.get('dates')})" for e in h.get("events", []) if e.get("descrip"))
+
+            overview = (
+                f"Deriv Market Symbol: {sym}\n"
+                f"Name: {name}\n"
+                f"Market: {market_name} > {submarket_name} (market code `{s.get('market')}`, "
+                f"submarket code `{s.get('submarket')}`)\n"
+                f"Use `{sym}` as the `underlying_symbol` / symbol value in API requests "
+                f"(e.g. `contracts_for`, `proposal`, `ticks`).\n"
+                f"Pip size: {s.get('pip_size')}\n"
+                + (hours_line + "\n" if hours_line else "")
+                + (f"Market events: {events}\n" if events else "")
+                + (f"Contract types available: {', '.join(categories)}\n" if categories
+                   else "No contracts were offered for this symbol at fetch time.\n")
+                + source_note
+            )
+            chunks.append(IngestedChunk(
+                chunk_id=f"live_symbol_{sym}",
+                source_type="live_market",
+                source_name=f"{sym} ({name}) - market info",
+                content=overview,
+                metadata={"symbol": sym, "market": s.get("market"), "submarket": s.get("submarket"),
+                          "fetched_at": fetched_at},
+            ))
+
+            if available:
+                header = (f"Deriv contracts available on {sym} ({name}), {market_name} > {submarket_name}.\n"
+                          f"{source_note}\n")
+                for i, text in enumerate(pack_lines(header, self._contract_lines(available))):
+                    chunks.append(IngestedChunk(
+                        chunk_id=f"live_contracts_{sym}_p{i}",
+                        source_type="live_market",
+                        source_name=f"{sym} ({name}) - contracts",
+                        content=text,
+                        metadata={"symbol": sym, "part": i, "fetched_at": fetched_at},
+                    ))
+
+        for (market_name, submarket_name), members in sorted(submarkets.items()):
+            header = f"Deriv {market_name} > {submarket_name}: symbols available ({len(members)}).\n{source_note}\n"
+            slug = re.sub(r"[^a-z0-9]+", "_", f"{market_name}_{submarket_name}".lower()).strip("_")
+            for i, text in enumerate(pack_lines(header, [f"  * {m}" for m in sorted(members)])):
+                chunks.append(IngestedChunk(
+                    chunk_id=f"live_submarket_{slug}_p{i}",
+                    source_type="live_market",
+                    source_name=f"{market_name} > {submarket_name} - symbol list",
+                    content=text,
+                    metadata={"market": market_name, "submarket": submarket_name, "fetched_at": fetched_at},
+                ))
+
+        print(f"  {len(data['active_symbols'])} symbols -> {len(chunks)} chunks (data as of {fetched_at}).")
+        return chunks
+
+
+# ---------------------------------------------------------------------------
 # Tokenizer for BM25
 # ---------------------------------------------------------------------------
 def tokenize(text: str) -> List[str]:
@@ -334,6 +790,8 @@ class FullIngestionPipeline:
         engine = DerivDataIngestionEngine()
 
         api_chunks = engine.fetch_live_deriv_api_schemas()
+        doc_chunks = engine.fetch_official_docs()
+        live_chunks = DerivLiveMarketIngestion().fetch_market_chunks()
         spec_chunks = engine.ingest_synthetic_indices_matrix()
 
         trading_policy_md = """
@@ -354,8 +812,9 @@ Traders can attach Take Profit and Stop Loss barriers directly to the proposal p
         """
         md_chunks = engine.ingest_markdown_knowledge_base(trading_policy_md)
 
-        self.chunks = api_chunks + spec_chunks + md_chunks
-        print(f"\nTotal semantic units prepared: {len(self.chunks)}")
+        self.chunks = api_chunks + doc_chunks + live_chunks + spec_chunks + md_chunks
+        print(f"\nTotal semantic units prepared: {len(self.chunks)} "
+              f"(api={len(api_chunks)}, docs={len(doc_chunks)}, live={len(live_chunks)}, specs={len(spec_chunks)}, policy={len(md_chunks)})")
 
         print("Generating embeddings and writing to Qdrant on disk...")
         texts = [c.content for c in self.chunks]

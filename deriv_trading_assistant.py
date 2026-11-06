@@ -19,8 +19,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Gemini 1.5 models are retired (that's the 404). Override via GEMINI_MODEL in .env if needed.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Older Gemini models get retired (404 "no longer available"). Override via GEMINI_MODEL in .env if needed.
+# gemini-3.8-flash / gemini-flash-latest hang through the legacy google.generativeai SDK; 3.5 works.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
 
 # ---------------------------------------------------------
@@ -104,7 +105,7 @@ class DerivTradingAssistant:
         self.bm25 = BM25Okapi(tokenized_corpus)
         print(f"Sparse index built successfully for {len(self.documents)} semantic chunks.")
 
-    def retrieve_and_rerank(self, query: str, top_k: int = 3, candidate_k: int = 10, rrf_k: int = 60) -> List[Dict[str, Any]]:
+    def retrieve_and_rerank(self, query: str, top_k: int = 3, candidate_k: int = 25, rrf_k: int = 60) -> List[Dict[str, Any]]:
         # A. Sparse retrieval (BM25) - skip zero-score docs so they don't pollute fusion
         bm25_scores = self.bm25.get_scores(tokenize(query))
         sparse_ranked_idx = [
@@ -299,6 +300,17 @@ async def lifespan(app: FastAPI):
         print(f"Failed to initialize DerivTradingAssistant: {e}")
         state["assistant"] = None
 
+    # The agent reuses the assistant's retriever (same Qdrant client, read-only) and adds live tools.
+    state["agent"] = None
+    if state["assistant"]:
+        try:
+            from deriv_agent import DerivAgent
+            state["agent"] = DerivAgent(state["assistant"], model=GEMINI_MODEL,
+                                        api_key=os.getenv("GEMINI_API_KEY"))
+            print("LangGraph agent ready (knowledge search + live Deriv tools).")
+        except Exception as e:
+            print(f"Failed to initialize LangGraph agent: {e}")
+
     yield
 
     state.clear()
@@ -328,6 +340,34 @@ def ask_question(req: QueryRequest):
         raise HTTPException(status_code=500, detail="RAG Engine is not initialized properly.")
 
     result = assistant.ask(req.query, top_k=req.top_k)
+
+    if result["status"] == "failed_guardrail":
+        raise HTTPException(status_code=422, detail=result)
+    elif result["status"] == "error":
+        raise HTTPException(status_code=502, detail=result)
+
+    return result
+
+
+class AgentQueryRequest(BaseModel):
+    query: str = Field(min_length=1)
+
+
+class AgentQueryResponse(QueryResponse):
+    tool_trace: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+@app.post("/api/v1/agent", response_model=AgentQueryResponse)
+def ask_agent(req: AgentQueryRequest):
+    """Agentic endpoint: the model chooses between knowledge-base search and live Deriv lookups."""
+    agent = state.get("agent")
+    if not agent:
+        raise HTTPException(status_code=500, detail="Agent is not initialized properly.")
+
+    try:
+        result = agent.ask(req.query)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"status": "error", "message": f"Agent failed: {e}"})
 
     if result["status"] == "failed_guardrail":
         raise HTTPException(status_code=422, detail=result)

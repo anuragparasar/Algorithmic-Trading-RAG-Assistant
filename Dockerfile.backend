@@ -8,10 +8,11 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY deriv_rag_pipeline.py deriv_trading_assistant.py ./
+COPY deriv_rag_pipeline.py deriv_trading_assistant.py deriv_agent.py ./
 
 # Hugging Face model cache (mounted as a volume in compose)
 ENV HF_HOME=/models
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 CMD ["python", "deriv_trading_assistant.py"]

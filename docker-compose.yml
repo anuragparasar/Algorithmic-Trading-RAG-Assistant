@@ -6,6 +6,9 @@ services:
     env_file: .env
     ports:
       - "8000:8000"
+    environment:
+      HF_HUB_OFFLINE: "1"   # models are already in the hf_cache volume; skip Hub checks at startup
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash}   # override: GEMINI_MODEL=... docker compose up -d api
     volumes:
       - qdrant_data:/app/deriv_rag_db
       - hf_cache:/models
@@ -17,6 +20,8 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     command: ["python", "deriv_rag_pipeline.py"]
+    environment:
+      HF_HUB_OFFLINE: "1"
     volumes:
       - qdrant_data:/app/deriv_rag_db
       - hf_cache:/models
